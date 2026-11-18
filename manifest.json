@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.frankekn.oled-guard",
+  "name": "OLED Guard",
+  "version": "1.0.0",
+  "author": "Frank Yang",
+  "license": "MIT",
+  "description": "Flicker-free DC-like dimming and Apple-style Eye Comfort controls for OLED laptops on Omarchy.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "OLED Guard",
+    "description": "Flicker-free DC-like dimming and Apple-style Eye Comfort controls for OLED laptops on Omarchy.",
+    "category": "System",
+    "aliases": [
+      "oled",
+      "dc-dimming",
+      "eye-care",
+      "pwm"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

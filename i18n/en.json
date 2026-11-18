@@ -1,0 +1,15 @@
+{
+  "title": "Eye Comfort",
+  "status.on": "On · %1%",
+  "status.off": "Off",
+  "status.clamshell": "External Display",
+  "status.issue": "Needs Attention",
+  "section.brightness": "Brightness",
+  "toggle.dc.title": "Flicker-Free Dimming",
+  "toggle.dc.desc": "Eliminate low-brightness OLED flicker automatically",
+  "toggle.gamut.title": "True Tone Natural Color",
+  "toggle.gamut.desc": "Soften harsh oversaturated colors",
+  "toggle.warmth.title": "Night Shift Warmth",
+  "toggle.warmth.desc": "Reduce harsh blue light day and night",
+  "footer.reboot": "Restart once to finish enabling deep anti-flicker optimization"
+}

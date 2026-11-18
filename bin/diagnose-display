@@ -1,0 +1,54 @@
+#!/bin/bash
+# Read-only display & flicker diagnostic report for Linux / Omarchy laptops.
+# Safe to run on any machine: inspects DMI, GPU driver, backlight sysfs, EDID, and compositor state.
+
+set -euo pipefail
+
+echo "=== 1. Machine ==="
+for f in sys_vendor product_name product_version; do
+  if [[ -r "/sys/devices/virtual/dmi/id/$f" ]]; then
+    printf '%s: %s\n' "$f" "$(<"/sys/devices/virtual/dmi/id/$f")"
+  fi
+done
+
+echo ""
+echo "=== 2. GPU & Kernel Driver ==="
+if command -v lspci >/dev/null 2>&1; then
+  lspci -nnk | grep -EA3 "VGA|3D|Display" || true
+fi
+printf 'cmdline: %s\n' "$(cat /proc/cmdline 2>/dev/null || true)"
+
+echo ""
+echo "=== 3. Backlight Devices ==="
+for bl in /sys/class/backlight/*; do
+  [[ -d $bl ]] || continue
+  cur="$(cat "$bl/brightness" 2>/dev/null || printf '?')"
+  max="$(cat "$bl/max_brightness" 2>/dev/null || printf '?')"
+  type="$(cat "$bl/type" 2>/dev/null || printf '?')"
+  printf '%s: brightness=%s/%s (type=%s)\n' "${bl##*/}" "$cur" "$max" "$type"
+done
+
+echo ""
+echo "=== 4. Connected DRM Panels & Decoded EDID ==="
+for conn in /sys/class/drm/card*-*; do
+  [[ -d $conn ]] || continue
+  status="$(cat "$conn/status" 2>/dev/null || printf 'unknown')"
+  [[ $status == "connected" ]] || continue
+  printf '\n--- %s (connected) ---\n' "${conn##*/}"
+  if [[ -r "$conn/edid" ]]; then
+    if command -v edid-decode >/dev/null 2>&1; then
+      edid-decode "$conn/edid" 2>/dev/null || strings "$conn/edid" || true
+    else
+      echo "(edid-decode not installed; raw strings below)"
+      strings "$conn/edid" || true
+    fi
+  fi
+done
+
+echo ""
+echo "=== 5. Hyprland & hyprsunset Live State ==="
+if command -v hyprctl >/dev/null 2>&1; then
+  hyprctl monitors all 2>/dev/null || echo "(hyprctl socket unreachable from current environment)"
+  printf 'hyprsunset gamma: %s\n' "$(hyprctl hyprsunset gamma 2>/dev/null || printf 'inactive')"
+  printf 'hyprsunset temperature: %s\n' "$(hyprctl hyprsunset temperature 2>/dev/null || printf 'inactive')"
+fi

@@ -1,0 +1,15 @@
+{
+  "title": "護眼模式",
+  "status.on": "開啟 · 亮度 %1%",
+  "status.off": "已關閉",
+  "status.clamshell": "外接螢幕模式",
+  "status.issue": "設定異常，點擊自動修復",
+  "section.brightness": "螢幕亮度",
+  "toggle.dc.title": "防閃爍調光",
+  "toggle.dc.desc": "消除低亮度頻閃，背景自動守護不跑掉",
+  "toggle.gamut.title": "原彩柔和顯示",
+  "toggle.gamut.desc": "收斂 OLED 過飽和刺眼紅綠光",
+  "toggle.warmth.title": "暖光護眼",
+  "toggle.warmth.desc": "柔化冷白藍光，隨日夜自動微調",
+  "footer.reboot": "下次重開機後將自動完成最後一項防微閃最佳化"
+}

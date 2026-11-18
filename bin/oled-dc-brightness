@@ -1,0 +1,546 @@
+#!/bin/bash
+# Flicker-free DC-like dimming and eye-comfort controller for OLED laptops on Omarchy / Hyprland.
+# Locks hardware backlight at 100% (minimizing low-frequency PWM off-duty-cycle)
+# and adjusts display brightness via hardware CTM (hyprsunset gamma).
+
+set -euo pipefail
+
+MIN_GAMMA=10
+MAX_GAMMA=100
+DEFAULT_GAMMA=75
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_FILE="$STATE_DIR/oled-dc-brightness"
+ENABLED_FILE="$STATE_DIR/oled-dc-enabled"
+LOCK_FILE="${XDG_RUNTIME_DIR:-$STATE_DIR}/oled-dc-brightness-ctl.lock"
+MONITORS_LUA="$HOME/.config/hypr/monitors.lua"
+
+no_osd=0
+monitor=""
+args=()
+while (( $# > 0 )); do
+  case "$1" in
+    --no-osd)
+      no_osd=1
+      shift
+      ;;
+    --monitor)
+      if (( $# < 2 )); then
+        exit 1
+      fi
+      monitor="$2"
+      shift 2
+      ;;
+    *)
+      args+=("$1")
+      shift
+      ;;
+  esac
+done
+
+cmd="${args[0]:-}"
+sub="${args[1]:-}"
+
+detect_backlight_device() {
+  if command -v omarchy-hw-display >/dev/null 2>&1; then
+    local dev
+    dev="$(omarchy-hw-display 2>/dev/null || true)"
+    if [[ -n $dev && -d "/sys/class/backlight/$dev" ]]; then
+      printf '%s\n' "$dev"
+      return 0
+    fi
+  fi
+  local first
+  for first in /sys/class/backlight/*; do
+    if [[ -d $first ]]; then
+      printf '%s\n' "${first##*/}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_dc_enabled() {
+  if [[ -r $ENABLED_FILE ]]; then
+    local val
+    val="$(tr -dc '0-9' <"$ENABLED_FILE" | head -c 1 || true)"
+    [[ $val != "0" ]]
+    return
+  fi
+  return 0
+}
+
+# Delegate to stock omarchy-brightness-display when an external monitor is targeted/focused,
+# or when anti-flicker DC dimming is explicitly turned off by the user.
+case "$cmd" in
+  restore|reconcile|repair|autoheal|reset|status|check|json|dc|gamut|warmth)
+    ;;
+  *)
+    target_monitor="$monitor"
+    if [[ -z $target_monitor ]] && command -v omarchy-hyprland-monitor-focused >/dev/null 2>&1; then
+      target_monitor="$(omarchy-hyprland-monitor-focused 2>/dev/null || true)"
+    fi
+    if [[ -n $target_monitor && ! $target_monitor =~ ^(eDP|LVDS|DSI)- ]] || ! is_dc_enabled; then
+      forward_args=()
+      if (( no_osd )); then
+        forward_args+=(--no-osd)
+      fi
+      if [[ -n $monitor ]]; then
+        forward_args+=(--monitor "$monitor")
+      fi
+      forward_args+=("${args[@]}")
+      exec omarchy-brightness-display "${forward_args[@]}"
+    fi
+    ;;
+esac
+
+clamp() {
+  local val="$1"
+  if (( val < MIN_GAMMA )); then
+    val=$MIN_GAMMA
+  fi
+  if (( val > MAX_GAMMA )); then
+    val=$MAX_GAMMA
+  fi
+  printf '%d\n' "$val"
+}
+
+read_saved_gamma() {
+  local saved=""
+  if [[ -r $STATE_FILE ]]; then
+    saved="$(tr -dc '0-9' <"$STATE_FILE" | head -c 4 || true)"
+  fi
+  if [[ -n $saved ]]; then
+    clamp "$saved"
+  else
+    printf '%d\n' "$DEFAULT_GAMMA"
+  fi
+}
+
+read_live_gamma() {
+  local out val
+  out="$(hyprctl hyprsunset gamma 2>/dev/null)" || return 1
+  val="$(awk '/^[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*$/ { printf "%d\n", $1; exit }' <<<"$out")"
+  if [[ -n $val ]]; then
+    printf '%d\n' "$val"
+    return 0
+  fi
+  return 1
+}
+
+read_hw_percent() {
+  local device
+  device="$(detect_backlight_device || true)"
+  [[ -n $device ]] || return 0
+  brightnessctl -d "$device" -m 2>/dev/null | awk -F, '{ gsub("%", "", $4); print $4 }' || true
+}
+
+ensure_hw_backlight_max() {
+  local device cur
+  device="$(detect_backlight_device || true)"
+  [[ -n $device ]] || return 0
+  cur="$(read_hw_percent)"
+  if [[ -n $cur ]] && (( cur < 100 )); then
+    brightnessctl -d "$device" set 100% >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_hyprsunset() {
+  if ! pgrep -x hyprsunset >/dev/null 2>&1; then
+    (
+      if [[ -n ${lock_fd:-} ]]; then
+        exec {lock_fd}>&- || true
+      fi
+      if command -v uwsm-app >/dev/null 2>&1; then
+        setsid uwsm-app -- hyprsunset >/dev/null 2>&1 &
+      else
+        setsid hyprsunset >/dev/null 2>&1 &
+      fi
+    )
+  fi
+}
+
+apply_gamma() {
+  local target="$1"
+  local retries="${2:-5}"
+  local i live
+
+  ensure_hyprsunset
+  for (( i = 0; i < retries; i++ )); do
+    hyprctl hyprsunset gamma "$target" >/dev/null 2>&1 || true
+    live="$(read_live_gamma || true)"
+    if [[ $live == "$target" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  return 0
+}
+
+internal_panel_active() {
+  hyprctl monitors -j 2>/dev/null | jq -e '[.[] | select((.name | test("^(eDP|LVDS|DSI)-")) and (.disabled == false))] | length > 0' >/dev/null 2>&1
+}
+
+detect_psr_state() {
+  local cmdline
+  cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+  if [[ $cmdline == *"xe.enable_psr=0"* && $cmdline == *"xe.enable_panel_replay=0"* ]] \
+    || [[ $cmdline == *"i915.enable_psr=0"* ]] \
+    || [[ $cmdline == *"amdgpu.dcdebugmask=0x10"* ]] \
+    || [[ $cmdline == *"amdgpu.dcdebugmask=0x210"* ]]; then
+    printf 'active\n'
+  elif compgen -G "/etc/limine-entry-tool.d/*no-psr*.conf" >/dev/null 2>&1; then
+    printf 'pending_reboot\n'
+  else
+    printf 'missing\n'
+  fi
+}
+
+preferred_warm_temp() {
+  local hour
+  hour="$(date +%H)"
+  if (( 10#$hour >= 19 || 10#$hour < 7 )); then
+    printf '4800\n'
+  else
+    printf '5700\n'
+  fi
+}
+
+if [[ $cmd == "json" ]]; then
+  device="$(detect_backlight_device || true)"
+  hw_cur="0"
+  hw_max="0"
+  if [[ -n $device ]]; then
+    hw_cur="$(cat "/sys/class/backlight/$device/brightness" 2>/dev/null || printf '0')"
+    hw_max="$(cat "/sys/class/backlight/$device/max_brightness" 2>/dev/null || printf '0')"
+  fi
+  hw_pct="$(read_hw_percent)"
+  live_gamma="$(read_live_gamma || printf '')"
+  saved_gamma="$(read_saved_gamma)"
+  dc_enabled="true"
+  if ! is_dc_enabled; then
+    dc_enabled="false"
+  fi
+  temp_raw="$(hyprctl hyprsunset temperature 2>/dev/null || true)"
+  live_temp="$(awk '/^[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*$/ { printf "%d", $1; exit }' <<<"$temp_raw")"
+  warmth_on="false"
+  if [[ -n $live_temp ]] && (( live_temp > 0 && live_temp < 6000 )); then
+    warmth_on="true"
+  fi
+  monitors_json="$(hyprctl monitors all -j 2>/dev/null || printf '[]')"
+  internal_mon="$(jq -r '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0].name // "eDP-1"' <<<"$monitors_json" 2>/dev/null || printf 'eDP-1')"
+  cm_preset="$(jq -r '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0].colorManagementPreset // "unknown"' <<<"$monitors_json" 2>/dev/null || printf 'unknown')"
+  internal_active="false"
+  if jq -e '[.[] | select((.name | test("^(eDP|LVDS|DSI)-")) and (.disabled == false))] | length > 0' <<<"$monitors_json" >/dev/null 2>&1; then
+    internal_active="true"
+  fi
+  psr_state="$(detect_psr_state)"
+
+  hw_ok="false"
+  if [[ $hw_cur =~ ^[0-9]+$ && $hw_max =~ ^[0-9]+$ ]] && (( hw_max > 0 && hw_cur == hw_max )); then
+    hw_ok="true"
+  fi
+  dc_ok="false"
+  if [[ $live_gamma =~ ^[0-9]+$ ]]; then
+    dc_ok="true"
+  fi
+  cm_ok="false"
+  if [[ $cm_preset == "edid" ]]; then
+    cm_ok="true"
+  fi
+
+  effective_brightness="$saved_gamma"
+  if [[ $dc_enabled == "true" ]]; then
+    if [[ $live_gamma =~ ^[0-9]+$ ]]; then
+      effective_brightness="$live_gamma"
+    fi
+  elif [[ $hw_pct =~ ^[0-9]+$ ]]; then
+    effective_brightness="$hw_pct"
+  fi
+
+  jq -cn \
+    --argjson dcEnabled "$dc_enabled" \
+    --arg internalMonitor "$internal_mon" \
+    --argjson hwCur "${hw_cur:-0}" \
+    --argjson hwMax "${hw_max:-0}" \
+    --argjson hwOk "$hw_ok" \
+    --argjson gamma "${effective_brightness:-100}" \
+    --argjson savedGamma "$saved_gamma" \
+    --argjson dcOk "$dc_ok" \
+    --argjson temp "${live_temp:-null}" \
+    --argjson warmthOn "$warmth_on" \
+    --arg cm "$cm_preset" \
+    --argjson cmOk "$cm_ok" \
+    --arg psrState "$psr_state" \
+    --argjson internalActive "$internal_active" \
+    '{dcEnabled:$dcEnabled,internalMonitor:$internalMonitor,hwCur:$hwCur,hwMax:$hwMax,hwOk:$hwOk,gamma:$gamma,savedGamma:$savedGamma,dcOk:$dcOk,temp:$temp,warmthOn:$warmthOn,cm:$cm,cmOk:$cmOk,psrState:$psrState,internalActive:$internalActive}'
+  exit 0
+fi
+
+if [[ $cmd == "check" ]]; then
+  device="$(detect_backlight_device || true)"
+  hw_cur="?"
+  hw_max="?"
+  if [[ -n $device ]]; then
+    hw_cur="$(cat "/sys/class/backlight/$device/brightness" 2>/dev/null || printf '?')"
+    hw_max="$(cat "/sys/class/backlight/$device/max_brightness" 2>/dev/null || printf '?')"
+  fi
+  live_gamma="$(read_live_gamma || printf 'inactive')"
+  saved_gamma="$(read_saved_gamma)"
+  temp_raw="$(hyprctl hyprsunset temperature 2>/dev/null || true)"
+  live_temp="$(awk '/^[[:space:]]*[0-9]+([.][0-9]+)?[[:space:]]*$/ { printf "%d", $1; exit }' <<<"$temp_raw")"
+  cm_preset="$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select(.name | test("^(eDP|LVDS|DSI)-"))][0].colorManagementPreset // "unknown"' || printf 'unknown')"
+  psr_state="$(detect_psr_state)"
+
+  if ! is_dc_enabled; then
+    printf -- '- Flicker-Free Dimming: Paused manually\n'
+  elif [[ $hw_cur == "$hw_max" && $hw_cur != "?" ]]; then
+    printf 'OK Hardware Backlight Locked 100%%: %s / %s\n' "$hw_cur" "$hw_max"
+  else
+    printf 'WARN Hardware Backlight Drifted: %s / %s (run oled-dc-brightness repair)\n' "$hw_cur" "$hw_max"
+  fi
+
+  if [[ $live_gamma =~ ^[0-9]+$ ]]; then
+    printf 'OK CTM Brightness: %s%% (saved %s%%)\n' "$live_gamma" "$saved_gamma"
+  else
+    printf 'WARN CTM Brightness: hyprsunset not responding\n'
+  fi
+
+  if [[ -n $live_temp ]] && (( live_temp < 6000 )); then
+    printf 'OK Night Shift Warmth: %sK\n' "$live_temp"
+  else
+    printf -- '- Night Shift Warmth: Off\n'
+  fi
+
+  if [[ $cm_preset == "edid" ]]; then
+    printf 'OK True Tone Gamut Clamp: edid\n'
+  else
+    printf -- '- True Tone Gamut Clamp: %s\n' "$cm_preset"
+  fi
+
+  case "$psr_state" in
+    active) printf 'OK Panel Self-Refresh (PSR): Disabled\n' ;;
+    pending_reboot) printf -- '- Panel Self-Refresh (PSR): Configured, pending reboot\n' ;;
+    *) printf -- '- Panel Self-Refresh (PSR): Default driver behavior\n' ;;
+  esac
+  exit 0
+fi
+
+if [[ -z $cmd || $cmd == "status" ]]; then
+  if is_dc_enabled; then
+    if [[ -r $STATE_FILE ]]; then
+      read_saved_gamma
+    else
+      read_live_gamma || read_saved_gamma
+    fi
+  else
+    hw_pct="$(read_hw_percent)"
+    printf '%s\n' "${hw_pct:-100}"
+  fi
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+
+exec {lock_fd}>"$LOCK_FILE"
+case "$cmd" in
+  restore|reconcile|repair|autoheal|reset|dc|gamut|warmth)
+    flock -w 3 "$lock_fd" || exit 0
+    ;;
+  *)
+    flock -n "$lock_fd" || exit 0
+    ;;
+esac
+
+release_lock() {
+  if [[ -n ${lock_fd:-} ]]; then
+    flock -u "$lock_fd" 2>/dev/null || true
+    exec {lock_fd}>&- 2>/dev/null || true
+    lock_fd=""
+  fi
+}
+
+case "$cmd" in
+  dc)
+    device="$(detect_backlight_device || true)"
+    if [[ $sub == "off" ]]; then
+      target="$(read_saved_gamma)"
+      printf '0\n' >"$ENABLED_FILE"
+      apply_gamma 100 10
+      if [[ -n $device ]]; then
+        brightnessctl -d "$device" set "${target}%" >/dev/null 2>&1 || true
+      fi
+    elif [[ $sub == "on" ]]; then
+      hw_pct="$(read_hw_percent)"
+      if [[ $hw_pct =~ ^[0-9]+$ ]] && (( hw_pct < 100 )); then
+        target="$(clamp "$hw_pct")"
+        printf '%d\n' "$target" >"$STATE_FILE"
+      else
+        target="$(read_saved_gamma)"
+      fi
+      printf '1\n' >"$ENABLED_FILE"
+      ensure_hw_backlight_max
+      apply_gamma "$target" 10
+    else
+      if is_dc_enabled; then
+        release_lock
+        exec "$0" dc off
+      else
+        release_lock
+        exec "$0" dc on
+      fi
+    fi
+    release_lock
+    exit 0
+    ;;
+  gamut)
+    target_cm="edid"
+    if [[ $sub == "off" ]]; then
+      target_cm="srgb"
+    fi
+    mon_name="$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select((.name | test("^(eDP|LVDS|DSI)-")) and (.disabled == false))][0].name // "eDP-1"' || printf 'eDP-1')"
+    if [[ $mon_name =~ ^[A-Za-z0-9._-]+$ ]]; then
+      hyprctl eval "hl.monitor({ output = \"$mon_name\", cm = \"$target_cm\" })" >/dev/null 2>&1 || true
+      if [[ -w $MONITORS_LUA ]]; then
+        sed -i -E "s|(output = \"${mon_name}\"[^}]*cm = \")[^\"]*(\")|\1${target_cm}\2|" "$MONITORS_LUA" || true
+      fi
+    fi
+    release_lock
+    exit 0
+    ;;
+  warmth)
+    ensure_hyprsunset
+    if [[ $sub == "off" ]]; then
+      hyprctl hyprsunset temperature 6500 >/dev/null 2>&1 || true
+      hyprctl hyprsunset identity >/dev/null 2>&1 || true
+    else
+      wtemp="$(preferred_warm_temp)"
+      for _ in {1..8}; do
+        hyprctl hyprsunset temperature "$wtemp" >/dev/null 2>&1 || true
+        t_now="$(hyprctl hyprsunset temperature 2>/dev/null | awk '/^[[:space:]]*[0-9]+/ { printf "%d", $1; exit }' || true)"
+        if [[ $t_now == "$wtemp" ]]; then
+          break
+        fi
+        sleep 0.15
+      done
+    fi
+    if is_dc_enabled && internal_panel_active; then
+      apply_gamma "$(read_saved_gamma)" 5
+    fi
+    release_lock
+    exit 0
+    ;;
+  autoheal|repair)
+    if [[ $cmd == "repair" ]]; then
+      printf '1\n' >"$ENABLED_FILE"
+    fi
+    if is_dc_enabled && internal_panel_active; then
+      target="$(read_saved_gamma)"
+      ensure_hw_backlight_max
+      apply_gamma "$target" 15
+    fi
+    if [[ $cmd == "repair" ]] && internal_panel_active; then
+      mon_name="$(hyprctl monitors -j 2>/dev/null | jq -r '[.[] | select((.name | test("^(eDP|LVDS|DSI)-")) and (.disabled == false))][0].name // "eDP-1"' || printf 'eDP-1')"
+      if [[ $mon_name =~ ^[A-Za-z0-9._-]+$ ]]; then
+        hyprctl eval "hl.monitor({ output = \"$mon_name\", cm = \"edid\" })" >/dev/null 2>&1 || true
+      fi
+    fi
+    release_lock
+    exit 0
+    ;;
+  restore)
+    if ! is_dc_enabled; then
+      release_lock
+      exit 0
+    fi
+    if pgrep -nx hyprsunset >/dev/null 2>&1; then
+      age="$(ps -o etimes= -p "$(pgrep -nx hyprsunset)" 2>/dev/null | tr -d ' ' || echo 10)"
+      if (( age < 2 )); then
+        sleep 1
+      fi
+    else
+      ensure_hyprsunset
+      sleep 1
+    fi
+    if internal_panel_active; then
+      target="$(read_saved_gamma)"
+      ensure_hw_backlight_max
+      apply_gamma "$target" 15
+    fi
+    release_lock
+    exit 0
+    ;;
+  reconcile)
+    if is_dc_enabled && internal_panel_active; then
+      target="$(read_saved_gamma)"
+      ensure_hw_backlight_max
+      apply_gamma "$target" 10
+    else
+      apply_gamma 100 10
+    fi
+    release_lock
+    exit 0
+    ;;
+  reset)
+    ensure_hw_backlight_max
+    apply_gamma 100 10
+    printf '100\n' >"$STATE_FILE"
+    release_lock
+    if (( ! no_osd )) && command -v omarchy-osd >/dev/null 2>&1; then
+      omarchy-osd -i brightness -p 100
+    fi
+    exit 0
+    ;;
+esac
+
+if [[ -r $STATE_FILE ]]; then
+  current="$(read_saved_gamma)"
+else
+  live_now="$(read_live_gamma || true)"
+  if [[ -n $live_now ]]; then
+    current="$(clamp "$live_now")"
+  else
+    current="$DEFAULT_GAMMA"
+  fi
+fi
+
+case "$cmd" in
+  "+5%"|up|raise)
+    target="$(clamp $(( current + 5 )))"
+    ;;
+  "5%-"|"-5%"|down|lower)
+    target="$(clamp $(( current - 5 )))"
+    ;;
+  "+1%")
+    target="$(clamp $(( current + 1 )))"
+    ;;
+  "1%-"|"-1%")
+    target="$(clamp $(( current - 1 )))"
+    ;;
+  *%*)
+    num="${cmd//%/}"
+    if [[ $num =~ ^[0-9]+$ ]]; then
+      target="$(clamp "$num")"
+    else
+      echo "Invalid brightness step: $cmd" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    if [[ $cmd =~ ^[0-9]+$ ]]; then
+      target="$(clamp "$cmd")"
+    else
+      echo "Usage: oled-dc-brightness [--no-osd] [--monitor name] [+5%|5%-|+1%|1%-|N%|dc|gamut|warmth|restore|reconcile|repair|autoheal|reset|status|check|json]" >&2
+      exit 1
+    fi
+    ;;
+esac
+
+ensure_hw_backlight_max
+apply_gamma "$target" 5
+printf '%d\n' "$target" >"$STATE_FILE"
+release_lock
+
+if (( ! no_osd )) && command -v omarchy-osd >/dev/null 2>&1; then
+  omarchy-osd -i brightness -p "$target"
+fi
