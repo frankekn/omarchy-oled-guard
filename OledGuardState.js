@@ -117,12 +117,12 @@ function parseState(raw) {
 function barAppearance(state) {
   var s = state || DEFAULT_STATE
   if (!s.internalActive || !s.dcEnabled) {
-    return { glyph: "\u{f0209}", dimmed: true, urgent: false }
+    return { glyph: "\uf070", dimmed: true, urgent: false }
   }
   if (!s.healthy) {
-    return { glyph: "\u{f0209}", dimmed: false, urgent: true }
+    return { glyph: "\uf070", dimmed: false, urgent: true }
   }
-  return { glyph: "\u{f0208}", dimmed: false, urgent: false }
+  return { glyph: "\uf06e", dimmed: false, urgent: false }
 }
 
 if (typeof module !== "undefined") {

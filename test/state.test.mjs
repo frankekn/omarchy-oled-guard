@@ -26,7 +26,7 @@ test("shows calm eye icon when protection is active and healthy", () => {
   assert.equal(s.needsHeal, false)
   assert.equal(s.internalMonitor, "eDP-1")
   assert.deepEqual(barAppearance(s), {
-    glyph: "\u{f0208}",
+    glyph: "\uf06e",
     dimmed: false,
     urgent: false
   })
@@ -53,7 +53,7 @@ test("shows dimmed crossed-eye when user turns protection off", () => {
   assert.equal(s.healthy, true)
   assert.equal(s.internalMonitor, "eDP-2")
   assert.deepEqual(barAppearance(s), {
-    glyph: "\u{f0209}",
+    glyph: "\uf070",
     dimmed: true,
     urgent: false
   })
@@ -78,7 +78,7 @@ test("flags needsHeal and urgent crossed-eye when hardware backlight drifts", ()
   assert.equal(s.healthy, false)
   assert.equal(s.needsHeal, true)
   assert.deepEqual(barAppearance(s), {
-    glyph: "\u{f0209}",
+    glyph: "\uf070",
     dimmed: false,
     urgent: true
   })
